@@ -1,0 +1,157 @@
+# ToolkitTest — compile on every push; the simulator walk and TestFlight when started.
+# Third-party actions are pinned by commit SHA.
+name: iOS
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      testflight:
+        description: "Upload to TestFlight after the simulator run"
+        type: boolean
+        default: false
+
+concurrency:
+  group: ios-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
+
+permissions:
+  contents: read
+
+jobs:
+  compile:
+    # macOS minutes are free only on a public repository. On the public-mirror
+    # route this file also sits in the private repo, where it must not run;
+    # on the private route set the repository variable IOS_BUILD_PRIVATE=1.
+    if: github.event.repository.private == false || vars.IOS_BUILD_PRIVATE == '1'
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Only source is tracked
+        run: bash ci/check-tree.sh
+      - name: Use the newest Xcode
+        run: sudo xcode-select -s "$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)" && xcodebuild -version
+      - name: Generate the Xcode project
+        run: bash generate.sh
+      - name: Build (unsigned) and build the UI tests
+        run: |
+          set -o pipefail
+          xcodebuild build -project ToolkitTest.xcodeproj -scheme ToolkitTest -destination 'generic/platform=iOS' \
+            CODE_SIGNING_ALLOWED=NO 2>&1 | tee build.log | grep -E "error:|BUILD (SUCCEEDED|FAILED)" || true
+          grep -q "BUILD SUCCEEDED" build.log
+          xcodebuild build-for-testing -project ToolkitTest.xcodeproj -scheme ToolkitTest \
+            -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO > tests.log 2>&1 || true
+          grep -E "error:" tests.log | sort -u | head -20 || true
+          grep -q "TEST BUILD SUCCEEDED" tests.log || { echo "the UI tests do not compile"; exit 1; }
+
+  simulator:
+    needs: compile
+    if: github.event_name == 'workflow_dispatch' && (github.event.repository.private == false || vars.IOS_BUILD_PRIVATE == '1')
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Use the newest Xcode
+        run: sudo xcode-select -s "$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)"
+      - name: Generate the Xcode project
+        run: bash generate.sh
+      - name: Start the mock server
+        run: |
+          node ci/mock-server.mjs > mock.log 2>&1 &
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:8787/health && break; sleep 1; done
+      - name: Pick the newest Pro Max
+        run: |
+          phone=$(xcrun simctl list devices available -j | python3 -c "
+          import json, re, sys
+          d = json.load(sys.stdin)['devices']
+          ios = [v for k, v in sorted(d.items(), key=lambda kv: [int(n) for n in re.findall(r'\\d+', kv[0])], reverse=True) if 'iOS' in k]
+          phones = [x for v in ios[:1] for x in v if x['name'].startswith('iPhone')] or [x for v in ios for x in v if x['name'].startswith('iPhone')]
+          gen = lambda x: int((re.findall(r'\\d+', x['name']) or ['0'])[0])
+          pm = [x for x in phones if 'Pro Max' in x['name']]
+          print(max(pm, key=gen)['udid'] if pm else phones[0]['udid'])
+          ")
+          echo "PHONE=$phone" >> "$GITHUB_ENV"
+      - name: UI tests, light and dark
+        run: |
+          xcrun simctl boot "$PHONE" || true
+          failed=0
+          for mode in light dark; do
+            xcrun simctl ui "$PHONE" appearance "$mode"
+            xcodebuild test -project ToolkitTest.xcodeproj -scheme ToolkitTest -destination "id=$PHONE" \
+              -resultBundlePath "results-$mode.xcresult" CODE_SIGNING_ALLOWED=NO > "test-$mode.log" 2>&1 || failed=1
+            grep -E "error: -\[|XCTAssert|failed -" "test-$mode.log" | sed -E 's/^.*error: //' | sort -u >> failures.txt || true
+          done
+          exit $failed
+      - name: Keep the screenshots and logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ui-results
+          path: |
+            results-*.xcresult
+            test-*.log
+            failures.txt
+            mock.log
+          retention-days: 7
+
+  testflight:
+    needs: [compile, simulator]
+    if: github.event_name == 'workflow_dispatch' && inputs.testflight
+    # The owner is the required reviewer of this environment: each upload waits for them.
+    environment: testflight
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Use the newest Xcode
+        run: sudo xcode-select -s "$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)"
+      - name: Generate the Xcode project
+        env:
+          DEVELOPMENT_TEAM: ${{ secrets.APPLE_TEAM_ID }}
+        run: bash generate.sh
+      - name: Archive and upload
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          KEY="$RUNNER_TEMP/asc-key.p8"
+          umask 077
+          printf '%s\n' "$ASC_PRIVATE_KEY" > "$KEY"
+          AUTH=(-allowProvisioningUpdates -authenticationKeyPath "$KEY"
+                -authenticationKeyID "$ASC_KEY_ID" -authenticationKeyIssuerID "$ASC_ISSUER_ID")
+          xcodebuild archive -project ToolkitTest.xcodeproj -scheme ToolkitTest -configuration Release \
+            -destination 'generic/platform=iOS' -archivePath "$RUNNER_TEMP/app.xcarchive" \
+            CURRENT_PROJECT_VERSION="${{ github.run_number }}" DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+            "${AUTH[@]}" 2>&1 | tee archive.log | grep -E "error:|ARCHIVE (SUCCEEDED|FAILED)" || true
+          grep -q "ARCHIVE SUCCEEDED" archive.log
+          # The test hook must not ship.
+          if find "$RUNNER_TEMP/app.xcarchive/Products" -type f -perm -u+x -exec strings {} \; 2>/dev/null | grep -q DOCKAI_TEST_SERVER; then
+            echo "The Release build contains the simulator test hook — refusing to upload"; exit 1
+          fi
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>upload</string>
+            <key>signingStyle</key><string>automatic</string>
+            <key>teamID</key><string>${APPLE_TEAM_ID}</string>
+          </dict></plist>
+          PLIST
+          xcodebuild -exportArchive -archivePath "$RUNNER_TEMP/app.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" -exportPath "$RUNNER_TEMP/export" "${AUTH[@]}"
+          rm -f "$KEY"
+          echo "Uploaded build ${{ github.run_number }}; it appears in TestFlight once Apple has processed it." >> "$GITHUB_STEP_SUMMARY"

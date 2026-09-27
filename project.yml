@@ -1,0 +1,51 @@
+# XcodeGen spec — the source of truth; the .xcodeproj is generated, never committed.
+name: ToolkitTest
+configFiles:
+  Debug: Config.xcconfig
+  Release: Config.xcconfig
+options:
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+targets:
+  ToolkitTest:
+    type: application
+    platform: iOS
+    sources: [App]
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        CFBundleDisplayName: ToolkitTest
+        # Only the system's HTTPS: exempt, so App Store Connect stops asking
+        # the export-compliance question on every build.
+        ITSAppUsesNonExemptEncryption: false
+        UILaunchScreen: {}
+        # Plain http to local addresses only — the simulator tests' mock server.
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(APP_BUNDLE_ID)
+        MARKETING_VERSION: $(MARKETING_VERSION)
+        CURRENT_PROJECT_VERSION: $(CURRENT_PROJECT_VERSION)
+        TARGETED_DEVICE_FAMILY: "1"
+  ToolkitTestUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources: [UITests, UITestsShared]
+    dependencies:
+      - target: ToolkitTest
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(APP_BUNDLE_ID).uitests
+        TEST_TARGET_NAME: ToolkitTest
+schemes:
+  ToolkitTest:
+    build:
+      targets:
+        ToolkitTest: all
+        ToolkitTestUITests: [test]
+    test:
+      targets: [ToolkitTestUITests]

@@ -1,0 +1,7 @@
+ToolkitTest.xcodeproj/
+build/
+*.xcresult
+*.log
+.DS_Store
+__pycache__/
+*.pyc

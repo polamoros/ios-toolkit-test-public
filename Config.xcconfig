@@ -1,0 +1,9 @@
+// Edit, then run ./generate.sh on a Mac (CI runs it for you).
+// Your Team ID: developer.apple.com → Membership. CI passes it from a secret.
+DEVELOPMENT_TEAM =
+APP_BUNDLE_ID = com.polamoros.toolkittest
+// The version people see (TestFlight, the App Store, Settings → About).
+// Raise it for each release people will notice; every target reads it here.
+MARKETING_VERSION = 0.1.0
+// CI overrides this with the run number, so every upload is unique.
+CURRENT_PROJECT_VERSION = 1
